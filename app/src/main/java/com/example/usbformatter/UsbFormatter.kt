@@ -122,10 +122,12 @@ class UsbFormatter(context: Context) {
             var comm: UsbCommunication? = null
             try {
                 if (!usbManager.hasPermission(device)) throw IOException("No USB permission for this drive")
-                val (c, block) = openRaw(device)
+                val (c, block) = openRawWithRetry(device)
                 comm = c
 
-                val total = block.blocks
+                // libaums reports the last block address, so the real sector count is one more.
+                val total = block.blocks + 1
+                val writer = DiskWriter(block)
                 if (block.blockSize != SECTOR) {
                     throw IOException("Unsupported sector size ${block.blockSize} (need 512)")
                 }
@@ -138,26 +140,50 @@ class UsbFormatter(context: Context) {
                 emit(FormatProgress.Message("Drive size: ${total * SECTOR / (1024 * 1024)} MB"))
 
                 emit(FormatProgress.Message("Wiping old partition tables…"))
-                zeroSectors(block, 0, PARTITION_START_LBA, 0, 3, ::emit)
-                val tail = minOf(34L, total - PARTITION_START_LBA)
-                zeroSectors(block, total - tail, tail, 3, 4, ::emit)
+                zeroSectors(writer, 0, PARTITION_START_LBA, 0, 3, ::emit)
+                // Stale backup GPT at the end of the disk: best effort, not critical.
+                runCatching {
+                    val tail = minOf(34L, total - PARTITION_START_LBA)
+                    zeroSectors(writer, total - tail, tail, 3, 4, ::emit)
+                }
 
                 val partSectors = total - PARTITION_START_LBA
                 emit(FormatProgress.Message("Writing partition table…"))
-                block.write(0, ByteBuffer.wrap(buildMbr(PARTITION_START_LBA, partSectors, fsType.mbrType)))
+                writer.write(0, buildMbr(PARTITION_START_LBA, partSectors, fsType.mbrType))
 
-                val vol = RawVolume(block, PARTITION_START_LBA, partSectors, ::emit)
+                val vol = RawVolume(writer, PARTITION_START_LBA, partSectors, ::emit)
                 when (fsType) {
                     FsType.FAT32 -> Fat32Formatter(vol).format(volumeLabel)
                     FsType.EXFAT -> ExFatFormatter(vol).format(volumeLabel)
                 }
                 emit(FormatProgress.Done)
             } catch (e: Exception) {
-                emit(FormatProgress.Error(e.message ?: "Format failed"))
+                val step = _state.value.message.trimEnd('…', '.', ' ')
+                val raw = e.message ?: "Format failed"
+                val tip = if (raw.contains("MAX_RECOVERY") || raw.contains("phase error")) {
+                    "\n\nThe drive stopped responding. Unplug it and plug it back in, try another " +
+                        "OTG adapter or port, check it isn't write-protected, then try again."
+                } else ""
+                emit(FormatProgress.Error(if (step.isNotBlank()) "While: $step\n$raw$tip" else "$raw$tip"))
             } finally {
                 runCatching { comm?.close() }
             }
         }
+    }
+
+    /** Opening can fail right after plug-in while the drive spins up; retry a few times. */
+    private fun openRawWithRetry(device: UsbDevice): Pair<UsbCommunication, BlockDeviceDriver> {
+        var last: IOException? = null
+        for (attempt in 1..3) {
+            try {
+                return openRaw(device)
+            } catch (e: IOException) {
+                last = e
+                emit(FormatProgress.Message("Drive not ready, retrying ($attempt/3)…"))
+                Thread.sleep(1000)
+            }
+        }
+        throw last ?: IOException("Could not open the drive")
     }
 
     private fun openRaw(device: UsbDevice): Pair<UsbCommunication, BlockDeviceDriver> {
@@ -183,7 +209,12 @@ class UsbFormatter(context: Context) {
             // GET MAX LUN; many devices ignore it, so failures are fine.
             runCatching { comm.controlTransfer(161, 254, 0, intf.id, ByteArray(1), 1) }
             val block = BlockDeviceDriverFactory.createBlockDevice(comm, lun = 0.toByte())
-            block.init()
+            try {
+                block.init()
+            } catch (e: Exception) {
+                runCatching { comm.close() }
+                throw if (e is IOException) e else IOException(e.message, e)
+            }
             return comm to block
         }
         throw IOException("No usable mass-storage interface found")
