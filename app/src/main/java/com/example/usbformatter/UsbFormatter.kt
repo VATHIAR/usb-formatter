@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
 import me.jahnen.libaums.core.driver.BlockDeviceDriver
 import me.jahnen.libaums.core.driver.BlockDeviceDriverFactory
@@ -28,17 +29,15 @@ import java.nio.ByteOrder
  *
  * Stock Android has no "format" API and SAF cannot format. The root-free route is the
  * USB Host API: claim the device, speak USB Mass Storage (Bulk-Only Transport) + SCSI
- * through libaums, and write raw 512-byte sectors ourselves (MBR + FAT32).
+ * through libaums, and write raw 512-byte sectors ourselves (MBR + FAT32 / exFAT).
  *
- * We open the *whole disk* (not libaums' partition objects) so blank / unsupported
- * drives also work and we can write a fresh partition table.
+ * We open the whole disk (not libaums' partition objects) so blank or unrecognised
+ * drives work too and we can write a fresh partition table.
  */
 
-enum class FsType(val label: String, val supported: Boolean, val note: String) {
-    FAT32("FAT32", true, ""),
-    EXFAT("exFAT", false, "not implemented yet"),
-    NTFS("NTFS", false, "needs root"),
-    EXT4("ext4", false, "needs root")
+enum class FsType(val label: String, val tagline: String, val mbrType: Int) {
+    FAT32("FAT32", "Works on almost everything. Files up to 4 GB.", 0x0C),
+    EXFAT("exFAT", "Big files and big drives. Modern devices.", 0x07)
 }
 
 sealed interface FormatProgress {
@@ -48,40 +47,48 @@ sealed interface FormatProgress {
     data class Error(val reason: String) : FormatProgress
 }
 
-class UnsupportedFsException(message: String) : Exception(message)
+enum class Phase { Idle, Running, Done, Error }
+
+data class FormatState(
+    val phase: Phase = Phase.Idle,
+    val message: String = "",
+    val percent: Int = 0
+)
 
 class UsbFormatter(context: Context) {
 
     private val appContext = context.applicationContext
     private val usbManager = appContext.getSystemService(Context.USB_SERVICE) as UsbManager
 
-    private val _progress = MutableStateFlow<FormatProgress>(FormatProgress.Message("Idle"))
-    val progress: StateFlow<FormatProgress> = _progress.asStateFlow()
-
-    private var lastPercent = 0
+    private val _state = MutableStateFlow(FormatState())
+    val state: StateFlow<FormatState> = _state.asStateFlow()
 
     companion object {
         private const val ACTION_USB_PERMISSION = "com.example.usbformatter.USB_PERMISSION"
-        const val SECTOR_SIZE = 512
         const val PARTITION_START_LBA = 2048L
     }
 
     /** Attached devices that expose a Mass Storage / SCSI / bulk-only interface. */
     fun listMassStorageDevices(): List<UsbDevice> =
-        usbManager.deviceList.values.filter { findMassStorageInterface(it) }
+        usbManager.deviceList.values.filter { dev ->
+            (0 until dev.interfaceCount).any {
+                val i = dev.getInterface(it)
+                i.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE &&
+                    i.interfaceSubclass == 6 && i.interfaceProtocol == 80
+            }
+        }.sortedBy { it.deviceName }
 
-    private fun findMassStorageInterface(d: UsbDevice): Boolean =
-        (0 until d.interfaceCount).any {
-            val i = d.getInterface(it)
-            i.interfaceClass == UsbConstants.USB_CLASS_MASS_STORAGE &&
-                i.interfaceSubclass == 6 && i.interfaceProtocol == 80
-        }
-
-    fun describe(d: UsbDevice): String {
-        val name = listOfNotNull(d.manufacturerName, d.productName).joinToString(" ")
-            .ifBlank { "USB device" }
-        return "$name (${"%04x:%04x".format(d.vendorId, d.productId)})"
+    fun displayName(d: UsbDevice): String {
+        val n = runCatching {
+            listOfNotNull(d.manufacturerName, d.productName).joinToString(" ")
+        }.getOrDefault("")
+        return n.ifBlank { "USB drive" }
     }
+
+    fun displayId(d: UsbDevice): String =
+        "ID %04x:%04x".format(d.vendorId, d.productId)
+
+    fun fail(reason: String) = emit(FormatProgress.Error(reason))
 
     fun requestPermission(device: UsbDevice, onResult: (Boolean) -> Unit) {
         if (usbManager.hasPermission(device)) {
@@ -108,45 +115,42 @@ class UsbFormatter(context: Context) {
         usbManager.requestPermission(device, pi)
     }
 
-    /** DESTROYS ALL DATA on [device]. Caller must have confirmed with the user. */
-    suspend fun format(device: UsbDevice, fsType: FsType, volumeLabel: String) =
+    /** DESTROYS ALL DATA on [device]. */
+    suspend fun format(device: UsbDevice, fsType: FsType, volumeLabel: String) {
         withContext(Dispatchers.IO) {
+            _state.value = FormatState(Phase.Running, "Opening drive…", 0)
             var comm: UsbCommunication? = null
             try {
-                if (!fsType.supported) {
-                    throw UnsupportedFsException(
-                        "${fsType.label} is ${fsType.note}. Use FAT32."
-                    )
-                }
-                if (!usbManager.hasPermission(device)) {
-                    emit(FormatProgress.Error("No USB permission for this device"))
-                    return@withContext
-                }
-                emit(FormatProgress.Message("Opening device…"))
+                if (!usbManager.hasPermission(device)) throw IOException("No USB permission for this drive")
                 val (c, block) = openRaw(device)
                 comm = c
 
                 val total = block.blocks
-                if (block.blockSize != SECTOR_SIZE) {
+                if (block.blockSize != SECTOR) {
                     throw IOException("Unsupported sector size ${block.blockSize} (need 512)")
                 }
                 if (total > 0xFFFFFFFFL) {
-                    throw IOException("Drive is larger than 2 TB; MBR/FAT32 can't address it")
+                    throw IOException("Drive is larger than 2 TB; MBR can't address it")
                 }
-                emit(FormatProgress.Message("Drive: ${total * SECTOR_SIZE / (1024 * 1024)} MB"))
+                if (total < PARTITION_START_LBA + 4096) {
+                    throw IOException("Drive is too small to format")
+                }
+                emit(FormatProgress.Message("Drive size: ${total * SECTOR / (1024 * 1024)} MB"))
 
                 emit(FormatProgress.Message("Wiping old partition tables…"))
-                zeroSectors(block, 0, PARTITION_START_LBA, 0, 5)
+                zeroSectors(block, 0, PARTITION_START_LBA, 0, 3, ::emit)
                 val tail = minOf(34L, total - PARTITION_START_LBA)
-                zeroSectors(block, total - tail, tail, 5, 6)
+                zeroSectors(block, total - tail, tail, 3, 4, ::emit)
 
                 val partSectors = total - PARTITION_START_LBA
                 emit(FormatProgress.Message("Writing partition table…"))
-                block.write(0, ByteBuffer.wrap(buildMbr(PARTITION_START_LBA, partSectors)))
+                block.write(0, ByteBuffer.wrap(buildMbr(PARTITION_START_LBA, partSectors, fsType.mbrType)))
 
-                Fat32Formatter(block, PARTITION_START_LBA, partSectors, ::emit).format(volumeLabel)
-
-                emit(FormatProgress.Percent(100))
+                val vol = RawVolume(block, PARTITION_START_LBA, partSectors, ::emit)
+                when (fsType) {
+                    FsType.FAT32 -> Fat32Formatter(vol).format(volumeLabel)
+                    FsType.EXFAT -> ExFatFormatter(vol).format(volumeLabel)
+                }
                 emit(FormatProgress.Done)
             } catch (e: Exception) {
                 emit(FormatProgress.Error(e.message ?: "Format failed"))
@@ -154,6 +158,7 @@ class UsbFormatter(context: Context) {
                 runCatching { comm?.close() }
             }
         }
+    }
 
     private fun openRaw(device: UsbDevice): Pair<UsbCommunication, BlockDeviceDriver> {
         for (idx in 0 until device.interfaceCount) {
@@ -184,12 +189,12 @@ class UsbFormatter(context: Context) {
         throw IOException("No usable mass-storage interface found")
     }
 
-    private fun buildMbr(startLba: Long, sectors: Long): ByteArray {
-        val b = ByteBuffer.allocate(SECTOR_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+    private fun buildMbr(startLba: Long, sectors: Long, type: Int): ByteArray {
+        val b = ByteBuffer.allocate(SECTOR).order(ByteOrder.LITTLE_ENDIAN)
         b.position(446)
-        b.put(0x00)                                           // not bootable
+        b.put(0x00)                                                     // not bootable
         b.put(byteArrayOf(0xFE.toByte(), 0xFF.toByte(), 0xFF.toByte())) // CHS start (use LBA)
-        b.put(0x0C)                                           // FAT32 LBA
+        b.put(type.toByte())
         b.put(byteArrayOf(0xFE.toByte(), 0xFF.toByte(), 0xFF.toByte())) // CHS end
         b.putInt(startLba.toInt())
         b.putInt(sectors.toInt())
@@ -199,148 +204,14 @@ class UsbFormatter(context: Context) {
         return b.array()
     }
 
-    private fun zeroSectors(
-        block: BlockDeviceDriver, start: Long, count: Long, pctLo: Int, pctHi: Int
-    ) {
-        val chunk = 256L
-        val zero = ByteArray((chunk * SECTOR_SIZE).toInt())
-        var done = 0L
-        while (done < count) {
-            val n = minOf(chunk, count - done)
-            val buf = if (n == chunk) zero else ByteArray((n * SECTOR_SIZE).toInt())
-            block.write(start + done, ByteBuffer.wrap(buf))
-            done += n
-            emit(FormatProgress.Percent(pctLo + ((pctHi - pctLo) * done / count).toInt()))
-        }
-    }
-
     internal fun emit(p: FormatProgress) {
-        _progress.value = p
-    }
-
-    /** Writes a fresh FAT32 volume inside the partition that starts at [startLba]. */
-    private inner class Fat32Formatter(
-        private val block: BlockDeviceDriver,
-        private val startLba: Long,
-        private val partSectors: Long,
-        private val report: (FormatProgress) -> Unit
-    ) {
-        private val bps = SECTOR_SIZE
-        private val reserved = 32
-        private val numFats = 2
-
-        fun format(rawLabel: String) {
-            val label = rawLabel.uppercase().filter { it.code in 0x20..0x7E }
-                .ifBlank { "USB" }.take(11)
-
-            val spc = sectorsPerCluster(partSectors)
-            val t1 = partSectors - reserved
-            val t2 = (256L * spc) + numFats
-            val spf = (t1 + (t2 - 1)) / t2
-
-            val dataStart = reserved + numFats * spf
-            val clusters = (partSectors - dataStart) / spc
-            if (clusters < 65525) {
-                throw IOException("Drive too small for FAT32 (needs roughly 33 MB or more)")
+        _state.update { s ->
+            when (p) {
+                is FormatProgress.Message -> s.copy(message = p.text)
+                is FormatProgress.Percent -> s.copy(percent = p.value.coerceIn(0, 100))
+                FormatProgress.Done -> FormatState(Phase.Done, "Done. Safe to remove the drive.", 100)
+                is FormatProgress.Error -> s.copy(phase = Phase.Error, message = p.reason)
             }
-
-            val volumeId = (System.currentTimeMillis() and 0xFFFFFFFFL).toInt()
-
-            report(FormatProgress.Message("Writing boot sector…"))
-            val boot = bootSector(spc, spf, volumeId, label)
-            writeSector(0, boot)
-            writeSector(6, boot)
-
-            report(FormatProgress.Message("Writing FSInfo…"))
-            writeSector(1, fsInfo())
-            writeSector(7, fsInfo())
-
-            report(FormatProgress.Message("Clearing FAT tables…"))
-            zeroRel(reserved.toLong(), numFats * spf, 6, 90)
-
-            val seed = ByteBuffer.allocate(bps).order(ByteOrder.LITTLE_ENDIAN)
-            seed.putInt(0x0FFFFFF8)
-            seed.putInt(0x0FFFFFFF)
-            seed.putInt(0x0FFFFFFF) // cluster 2 (root dir) = end of chain
-            for (f in 0 until numFats) writeSector(reserved + f * spf, seed.array())
-
-            report(FormatProgress.Message("Writing root directory…"))
-            zeroRel(dataStart, spc.toLong(), 90, 98)
-            val entry = ByteArray(bps)
-            System.arraycopy(label.padEnd(11).toByteArray(Charsets.US_ASCII), 0, entry, 0, 11)
-            entry[11] = 0x08 // volume label attribute
-            writeSector(dataStart, entry)
-
-            report(FormatProgress.Message("FAT32 format complete"))
-        }
-
-        private fun sectorsPerCluster(sectors: Long): Int {
-            val mb = sectors * bps / (1024 * 1024)
-            return when {
-                mb <= 260 -> 1
-                mb <= 8_192 -> 8
-                mb <= 16_384 -> 16
-                mb <= 32_768 -> 32
-                else -> 64
-            }
-        }
-
-        private fun bootSector(spc: Int, spf: Long, volumeId: Int, label: String): ByteArray {
-            val b = ByteBuffer.allocate(bps).order(ByteOrder.LITTLE_ENDIAN)
-            b.put(byteArrayOf(0xEB.toByte(), 0x58, 0x90.toByte()))
-            b.put("MSWIN4.1".toByteArray(Charsets.US_ASCII))
-            b.putShort(bps.toShort())
-            b.put(spc.toByte())
-            b.putShort(reserved.toShort())
-            b.put(numFats.toByte())
-            b.putShort(0)                      // root entries
-            b.putShort(0)                      // total sectors 16
-            b.put(0xF8.toByte())               // media
-            b.putShort(0)                      // FAT size 16
-            b.putShort(63)                     // sectors/track
-            b.putShort(255)                    // heads
-            b.putInt(startLba.toInt())         // hidden sectors
-            b.putInt(partSectors.toInt())      // total sectors 32
-            b.putInt(spf.toInt())              // FAT size 32
-            b.putShort(0)                      // ext flags
-            b.putShort(0)                      // fs version
-            b.putInt(2)                        // root cluster
-            b.putShort(1)                      // FSInfo sector
-            b.putShort(6)                      // backup boot sector
-            b.put(ByteArray(12))
-            b.put(0x80.toByte())               // drive number
-            b.put(0)
-            b.put(0x29)                        // extended boot signature
-            b.putInt(volumeId)
-            b.put(label.padEnd(11).toByteArray(Charsets.US_ASCII))
-            b.put("FAT32   ".toByteArray(Charsets.US_ASCII))
-            b.position(510)
-            b.put(0x55)
-            b.put(0xAA.toByte())
-            return b.array()
-        }
-
-        private fun fsInfo(): ByteArray {
-            val b = ByteBuffer.allocate(bps).order(ByteOrder.LITTLE_ENDIAN)
-            b.putInt(0x41615252)
-            b.position(484)
-            b.putInt(0x61417272)
-            b.putInt(-1)                       // free clusters unknown
-            b.putInt(-1)                       // next free unknown
-            b.position(508)
-            b.putInt(0xAA550000.toInt())
-            return b.array()
-        }
-
-        /** [rel] is relative to the partition start. */
-        private fun writeSector(rel: Long, data: ByteArray) {
-            block.write(startLba + rel, ByteBuffer.wrap(data))
-        }
-
-        private fun writeSector(rel: Int, data: ByteArray) = writeSector(rel.toLong(), data)
-
-        private fun zeroRel(rel: Long, count: Long, pctLo: Int, pctHi: Int) {
-            zeroSectors(block, startLba + rel, count, pctLo, pctHi)
         }
     }
 }

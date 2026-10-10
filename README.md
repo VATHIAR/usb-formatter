@@ -1,10 +1,10 @@
 # USB Formatter
 
-Root-free Android app that formats a USB drive (MBR + FAT32) over the USB Host API,
+Root-free Android app that formats a USB drive (MBR + FAT32 or exFAT) over the USB Host API,
 using [libaums](https://github.com/magnusja/libaums) for the Mass Storage / SCSI transport.
 
-- FAT32: implemented (not yet verified on hardware; test with a spare drive first).
-- exFAT: not implemented. NTFS / ext4: not possible without root.
+- FAT32 and exFAT are implemented. Neither has been verified on hardware yet; test with a spare drive first.
+- NTFS and ext4 are not offered (they need root).
 
 ## Build
 
